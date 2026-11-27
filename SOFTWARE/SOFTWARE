@@ -1,27 +1,22 @@
 // ============================================================
 //  Plantify — ESP32 DEVKITC 38 pines
-//  Versión con sensor BME680 (reemplaza DHT22 + MQ-135)
+//  Versión con sensor BME680 + HORA (NTP) + CLIMA (Lomas de Zamora)
 //
-//  PINOUT actualizado:
+//  PINOUT:
 //
 //  SENSORES (entrada):
 //    GPIO21 → BME680 SDA        (bus I2C compartido con OLED)
 //    GPIO22 → BME680 SCL        (bus I2C compartido con OLED)
 //    GPIO35 → Suelo AOUT        (solo lectura)
 //    GPIO34 → LDR               (solo lectura, divisor R4+R5)
-//    GPIO33 → libre (antes DHT22)
 //    GPIO36 → libre (antes MQ-135)
 //
 //  ACTUADORES (salida):
-//    GPIO14 → Relay K1 IN       (bomba de agua)
-//    GPIO13 → Buzzer (+)
+//    GPIO33 → Relay K1 IN       (bomba de agua)
+//    GPIO19 → Buzzer (+)
 //    GPIO18 → LED RGB Rojo  (R) (con R1 220Ω)
 //    GPIO17 → LED RGB Verde (G) (con R2 220Ω)
 //    GPIO16 → LED RGB Azul  (B) (con R3 220Ω)
-//
-//  I2C (BME680 + OLED SSD1306 comparten el mismo bus):
-//    GPIO21 → SDA
-//    GPIO22 → SCL
 //
 //  ALIMENTACIÓN:
 //    +3.3V → OLED VCC, BME680 VCC, Suelo VCC, LDR divisor
@@ -34,20 +29,30 @@
 //    - Adafruit SSD1306
 //    - Adafruit GFX Library
 //    - Blynk (buscar "Blynk" en Library Manager)
+//    - ArduinoJson (de Benoit Blanchon, versión 7.x)   <-- NUEVA
+//    (HTTPClient, WiFiClientSecure y time.h ya vienen con el core ESP32)
+//
+//  NOVEDADES EN ESTA VERSIÓN:
+//    - Hora y fecha por internet (NTP), zona Argentina UTC-3.
+//    - Clima actual de Lomas de Zamora desde Open-Meteo
+//      (gratis, sin API key). Se actualiza cada 15 minutos.
+//    - La OLED alterna entre 2 pantallas cada 5 s:
+//        Pantalla 1: sensores de la planta (+ hora arriba a la derecha)
+//        Pantalla 2: reloj grande, fecha y clima exterior
+//    - El clima se muestra SOLO en la OLED (no se envía a Blynk)
 //
 //  NOTA SOBRE EL BME680:
-//    El sensor de gas del BME680 mide una RESISTENCIA (en Ohms):
-//    cuanto MÁS alta la resistencia, MEJOR la calidad del aire
-//    (menos compuestos volátiles / VOC). Es lo opuesto a como
-//    se leía el MQ-135 (donde un ADC alto era aire malo).
-//    Los umbrales GAS_BUENO / GAS_MALO son un punto de partida:
-//    conviene calibrarlos observando los valores reales del
-//    ambiente durante unos días, y dejar ~5 minutos de
-//    calentamiento del sensor antes de tomar lecturas serias.
+//    El sensor de gas mide una RESISTENCIA (Ohms): cuanto MÁS alta,
+//    MEJOR la calidad del aire. Calibrar GAS_BUENO / GAS_MALO con
+//    valores reales y dejar ~5 min de calentamiento.
 // ============================================================
 
 // ── LIBRERÍAS ────────────────────────────────────────────────
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
 #include <BlynkSimpleEsp32.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME680.h>
@@ -62,13 +67,31 @@
 const char* ssid     = "TU_WIFI_SSID";
 const char* password = "TU_WIFI_PASSWORD";
 
+// ── HORA (NTP) ───────────────────────────────────────────────
+#define NTP_SERVER1       "pool.ntp.org"
+#define NTP_SERVER2       "time.google.com"
+#define GMT_OFFSET_SEG    (-3 * 3600)   // Argentina = UTC-3
+#define DST_OFFSET_SEG    0             // Argentina no usa horario de verano
+
+// ── CLIMA: Lomas de Zamora, Buenos Aires ─────────────────────
+// API Open-Meteo (sin API key)
+#define CLIMA_NOMBRE      "Lomas de Zamora"
+#define CLIMA_LAT         "-34.7613"
+#define CLIMA_LON         "-58.4008"
+#define URL_CLIMA \
+  "https://api.open-meteo.com/v1/forecast?latitude=" CLIMA_LAT \
+  "&longitude=" CLIMA_LON \
+  "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m" \
+  "&timezone=America%2FArgentina%2FBuenos_Aires"
+#define INTERVALO_CLIMA   900000UL      // Actualizar clima cada 15 min
+
 // ── PINES — SENSORES ─────────────────────────────────────────
 #define PIN_SUELO     35    // Sensor suelo AOUT (solo lectura)
 #define PIN_LDR       34    // LDR divisor tensión (solo lectura)
 
 // ── PINES — ACTUADORES ───────────────────────────────────────
-#define PIN_RELAY     14    // Relay K1 → bomba de agua
-#define PIN_BUZZER    13    // Buzzer activo
+#define PIN_RELAY     33    // Relay K1 → bomba de agua
+#define PIN_BUZZER    19    // Buzzer activo
 #define PIN_LED_R     18    // LED RGB canal Rojo
 #define PIN_LED_G     17    // LED RGB canal Verde
 #define PIN_LED_B     16    // LED RGB canal Azul
@@ -100,6 +123,8 @@ BlynkTimer timer;
 // ── TIEMPOS ───────────────────────────────────────────────────
 #define INTERVALO_LECTURA   2000        // Leer sensores cada 2s
 #define INTERVALO_BLYNK     5000        // Enviar a Blynk cada 5s
+#define INTERVALO_OLED      1000        // Refrescar pantalla cada 1s (reloj)
+#define TIEMPO_PAGINA_MS    5000        // Cada cuánto cambia la pantalla OLED
 #define TIEMPO_RIEGO_MS     4000        // Duración de cada riego (4s)
 #define ESPERA_RIEGO_MS     300000UL    // Mínimo entre riegos (5 min)
 
@@ -115,12 +140,100 @@ bool  bombaActiva     = false;
 int   contAlertas     = 0;
 unsigned long tRiego  = 0;
 
+// Clima exterior
+bool  climaOk         = false;
+float climaTemp       = 0;
+int   climaHum        = 0;
+int   climaCodigo     = 0;
+float climaViento     = 0;      // km/h
+
 // ── BLYNK VIRTUAL PINS ───────────────────────────────────────
 // V0 → Temperatura        V5 → Estado salud (0/1/2)
 // V1 → Humedad            V6 → Botón riego manual
 // V2 → Calidad aire (Ohms) V7 → Color LED estado
 // V3 → Suelo (%)          V8 → Presión (hPa)
 // V4 → Luz (%)
+
+// ── PROTOTIPOS ───────────────────────────────────────────────
+void leerSensores();
+void enviarBlynk();
+void controlarRiego();
+void evaluarSalud();
+void actualizarOLED();
+void obtenerClima();
+void mostrarPantallaBienvenida();
+void beepSuave();
+void beepAlerta();
+
+// ============================================================
+//  HORA: helpers
+// ============================================================
+// Devuelve true si la hora ya fue sincronizada por NTP
+bool obtenerHora(struct tm &t) {
+  if (!getLocalTime(&t, 10)) return false;   // no bloquea (10 ms)
+  return t.tm_year > (2020 - 1900);          // descarta 1970 sin sincronizar
+}
+
+// ============================================================
+//  CLIMA: descripción corta (sin tildes, la OLED no las dibuja)
+//  Códigos WMO de Open-Meteo
+// ============================================================
+const char* descripcionClima(int c) {
+  if (c == 0)               return "Despejado";
+  if (c == 1)               return "Casi despej.";
+  if (c == 2)               return "Parc. nublado";
+  if (c == 3)               return "Nublado";
+  if (c == 45 || c == 48)   return "Niebla";
+  if (c >= 51 && c <= 57)   return "Llovizna";
+  if (c >= 61 && c <= 67)   return "Lluvia";
+  if (c >= 71 && c <= 77)   return "Nieve";
+  if (c >= 80 && c <= 82)   return "Chubascos";
+  if (c >= 85 && c <= 86)   return "Nevada";
+  if (c == 95)              return "Tormenta";
+  if (c == 96 || c == 99)   return "Tormenta/granizo";
+  return "Sin datos";
+}
+
+// ============================================================
+//  CLIMA: consulta a Open-Meteo
+// ============================================================
+void obtenerClima() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure cliente;
+  cliente.setInsecure();               // sin verificar certificado (simple)
+  HTTPClient http;
+  http.setTimeout(6000);
+
+  if (!http.begin(cliente, URL_CLIMA)) {
+    Serial.println("[CLIMA] No se pudo iniciar la conexión");
+    return;
+  }
+
+  int codigo = http.GET();
+  if (codigo == 200) {
+    String payload = http.getString();
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, payload);
+    if (!err) {
+      JsonObject cur = doc["current"];
+      climaTemp   = cur["temperature_2m"]       | 0.0f;
+      climaHum    = cur["relative_humidity_2m"] | 0;
+      climaCodigo = cur["weather_code"]         | 0;
+      climaViento = cur["wind_speed_10m"]       | 0.0f;
+      climaOk     = true;
+      Serial.printf("[CLIMA] %s: %.1fC H:%d%% Viento:%.0fkm/h (%s)\n",
+        CLIMA_NOMBRE, climaTemp, climaHum, climaViento,
+        descripcionClima(climaCodigo));
+    } else {
+      Serial.print("[CLIMA] Error JSON: ");
+      Serial.println(err.c_str());
+    }
+  } else {
+    Serial.printf("[CLIMA] Error HTTP: %d\n", codigo);
+  }
+  http.end();
+}
 
 // ============================================================
 //  SETUP
@@ -167,9 +280,18 @@ void setup() {
   Blynk.begin(BLYNK_AUTH_TOKEN, ssid, password);
   Serial.println("\nBlynk conectado!");
 
+  // ── Hora por NTP (Argentina UTC-3) ──
+  configTime(GMT_OFFSET_SEG, DST_OFFSET_SEG, NTP_SERVER1, NTP_SERVER2);
+  Serial.println("Sincronizando hora NTP...");
+
+  // ── Primer consulta de clima ──
+  obtenerClima();
+
   // ── Timers periódicos ──
   timer.setInterval(INTERVALO_LECTURA, leerSensores);
   timer.setInterval(INTERVALO_BLYNK,   enviarBlynk);
+  timer.setInterval(INTERVALO_OLED,    actualizarOLED);
+  timer.setInterval(INTERVALO_CLIMA,   obtenerClima);
 
   // ── LED verde de inicio (sistema OK) ──
   digitalWrite(PIN_LED_G, HIGH);
@@ -208,9 +330,8 @@ void leerSensores() {
   Serial.printf("[SENSORES] T:%.1f°C H:%.1f%% P:%.1fhPa Gas:%.0fOhm Suelo:%d LDR:%d\n",
     temperatura, humedad, presion, gasResistencia, valorSuelo, valorLDR);
 
-  // Evaluar estado y actualizar salidas
+  // Evaluar estado (la OLED se refresca en su propio timer cada 1 s)
   evaluarSalud();
-  actualizarOLED();
 }
 
 // ============================================================
@@ -298,16 +419,17 @@ void controlarRiego() {
 }
 
 // ============================================================
-//  ACTUALIZAR PANTALLA OLED
+//  PANTALLA OLED — PÁGINA 1: SENSORES (+ hora arriba a la derecha)
 // ============================================================
-void actualizarOLED() {
-  pantalla.clearDisplay();
-  pantalla.setTextColor(SSD1306_WHITE);
-  pantalla.setTextSize(1);
-
-  // Fila 1: Temperatura y humedad
+void dibujarPaginaSensores() {
+  // Fila 1: Temperatura, humedad y hora (HH:MM) a la derecha
   pantalla.setCursor(0, 0);
-  pantalla.printf("T:%.1fC  H:%.0f%%", temperatura, humedad);
+  pantalla.printf("T:%.1fC H:%.0f%%", temperatura, humedad);
+
+  struct tm t;
+  pantalla.setCursor(98, 0);
+  if (obtenerHora(t)) pantalla.printf("%02d:%02d", t.tm_hour, t.tm_min);
+  else                pantalla.print("--:--");
 
   // Fila 2: Calidad del aire
   pantalla.setCursor(0, 12);
@@ -322,7 +444,7 @@ void actualizarOLED() {
   String estadoLuz   = valorLDR   > LUZ_BAJA   ? "Baja" : "OK";
   pantalla.printf("Suelo:%-4s  Luz:%s", estadoSuelo.c_str(), estadoLuz.c_str());
 
-  // Fila 4: Estado de salud (texto grande)
+  // Fila 4: Estado de salud
   pantalla.setCursor(0, 38);
   switch (estadoSalud) {
     case 0: pantalla.println(">> AMBIENTE OK"); break;
@@ -335,6 +457,54 @@ void actualizarOLED() {
     pantalla.setCursor(0, 52);
     pantalla.println("Regando planta...");
   }
+}
+
+// ============================================================
+//  PANTALLA OLED — PÁGINA 2: RELOJ + CLIMA EXTERIOR
+// ============================================================
+void dibujarPaginaRelojClima() {
+  struct tm t;
+  bool horaOk = obtenerHora(t);
+
+  // Título: ciudad
+  pantalla.setCursor(0, 0);
+  pantalla.print(CLIMA_NOMBRE);
+
+  // Hora grande HH:MM:SS (tamaño 2 → 12 px por caracter, 8 chars = 96 px)
+  pantalla.setTextSize(2);
+  pantalla.setCursor(8, 12);
+  if (horaOk) pantalla.printf("%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+  else        pantalla.print("--:--:--");
+  pantalla.setTextSize(1);
+
+  // Fecha
+  pantalla.setCursor(0, 32);
+  if (horaOk) pantalla.printf("%02d/%02d/%04d", t.tm_mday, t.tm_mon + 1, t.tm_year + 1900);
+  else        pantalla.print("Sincronizando hora");
+
+  // Clima exterior
+  if (climaOk) {
+    pantalla.setCursor(0, 43);
+    pantalla.printf("Ext:%.1fC H:%d%%", climaTemp, climaHum);
+    pantalla.setCursor(0, 54);
+    pantalla.printf("%s V:%.0fkm/h", descripcionClima(climaCodigo), climaViento);
+  } else {
+    pantalla.setCursor(0, 48);
+    pantalla.print("Clima: sin datos");
+  }
+}
+
+// ============================================================
+//  ACTUALIZAR PANTALLA OLED (alterna páginas cada 5 s)
+// ============================================================
+void actualizarOLED() {
+  pantalla.clearDisplay();
+  pantalla.setTextColor(SSD1306_WHITE);
+  pantalla.setTextSize(1);
+
+  int pagina = (millis() / TIEMPO_PAGINA_MS) % 2;
+  if (pagina == 0) dibujarPaginaSensores();
+  else             dibujarPaginaRelojClima();
 
   pantalla.display();
 }
